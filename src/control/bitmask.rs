@@ -105,6 +105,12 @@ impl IntoIterator for BitMask {
 #[derive(Clone)]
 pub(crate) struct BitMaskIter(pub(crate) BitMask);
 
+impl BitMaskIter {
+    pub(crate) const fn new() -> Self {
+        BitMaskIter(BitMask(0))
+    }
+}
+
 impl Iterator for BitMaskIter {
     type Item = usize;
 

@@ -1348,6 +1348,17 @@ impl<T, A: Allocator> RawTable<T, A> {
         }
     }
 
+    /// Returns a RawTable that can only ever decrease in size
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn into_drain(self) -> RawDrainingTable<T, A> {
+        unsafe {
+            RawDrainingTable {
+                iter: self.iter().iter,
+                raw: self,
+            }
+        }
+    }
+
     /// Returns an iterator which removes all elements from the table without
     /// freeing the memory.
     ///
@@ -3398,6 +3409,21 @@ pub(crate) struct RawIterRange<T> {
 }
 
 impl<T> RawIterRange<T> {
+    /// # Safety
+    ///
+    /// You must never call next_impl on this value.
+    /// The contents of this range are garbage and using it will result in UB.
+    pub(crate) const unsafe fn empty() -> Self {
+        Self {
+            current_group: BitMaskIter::new(),
+            data: Bucket {
+                ptr: NonNull::dangling(),
+            },
+            next_ctrl: core::ptr::dangling_mut(),
+            end: core::ptr::dangling_mut(),
+        }
+    }
+
     /// Returns a `RawIterRange` covering a subset of a table.
     ///
     /// # Safety
@@ -4159,6 +4185,148 @@ impl<T, A: Allocator> RawExtractIf<'_, T, A> {
             }
         }
         None
+    }
+}
+
+/// A `RawTable` that can never have new elements inserted into it.
+/// Existing elements may be retrieved, removed, and modified, but never inserted.
+///
+/// This `struct` is created by [`RawTable::into_drain`].
+#[must_use = "Iterators are lazy unless consumed"]
+pub struct RawDrainingTable<T, A: Allocator = Global> {
+    iter: RawIterRange<T>,
+    raw: RawTable<T, A>,
+}
+
+impl<T, A: Allocator> Iterator for RawDrainingTable<T, A> {
+    type Item = T;
+
+    #[cfg_attr(feature = "inline-more", inline)]
+    fn next(&mut self) -> Option<T> {
+        // Inner iterator iterates over buckets
+        // so it can do unnecessary work if we already yielded all items.
+        if self.raw.len() == 0 {
+            return None;
+        }
+
+        // SAFETY: We check number of items to yield using `len` field.
+        let nxt = unsafe { self.iter.next_impl::<false>() };
+
+        debug_assert!(nxt.is_some());
+        // SAFETY: next_impl cannot return None if `DO_CHECK_PTR_RANGE` is false
+        let nxt = unsafe { nxt.unwrap_unchecked() };
+
+        // SAFETY: we know the bucket was allocated in this rawtable.
+        Some(unsafe { self.raw.remove(nxt) }.0)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.raw.len(), Some(self.raw.len()))
+    }
+
+    #[inline]
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let Self { iter, mut raw } = self;
+        unsafe { iter.fold_impl(raw.len(), init, |b, bucket| f(b, raw.remove(bucket).0)) }
+    }
+}
+
+impl<T, A: Allocator> FusedIterator for RawDrainingTable<T, A> {}
+
+impl<T> RawDrainingTable<T> {
+    /// Creates an empty `RawDrainingTable`.
+    #[inline]
+    pub const fn empty() -> Self {
+        Self {
+            // Safety: since the table is empty, we will never touch this.
+            iter: unsafe { RawIterRange::empty() },
+            raw: RawTable::new(),
+        }
+    }
+}
+
+impl<T, A: Allocator> RawDrainingTable<T, A> {
+    /// Gets a reference to an element in the table.
+    #[inline]
+    pub fn get(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
+        self.raw.get(hash, eq)
+    }
+
+    /// Searches for an element in the table.
+    #[inline]
+    pub fn find(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<Bucket<T>> {
+        self.raw.find(hash, eq)
+    }
+
+    /// Returns the number of elements in the table.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// Returns the total amount of memory allocated internally by the hash
+    /// table, in bytes.
+    ///
+    /// The returned number is informational only. It is intended to be
+    /// primarily used for memory profiling.
+    #[inline]
+    pub fn allocation_size(&self) -> usize {
+        self.raw.allocation_size()
+    }
+
+    /// Removes all elements from the table without freeing the backing memory.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.raw.clear();
+    }
+
+    /// Returns an iterator over every element in the table. It is up to
+    /// the caller to ensure that the `RawTable` outlives the `RawIter`.
+    /// Because we cannot make the `next` method unsafe on the `RawIter`
+    /// struct, we have to make the `iter` method unsafe.
+    #[inline]
+    pub unsafe fn iter(&self) -> RawIter<T> {
+        // SAFETY:
+        // 1. The caller must uphold the safety contract for `iter` method.
+        // 2. The [`RawTableInner`] must already have properly initialized control bytes since
+        //    we will never expose RawTable::new_uninitialized in a public API.
+        RawIter {
+            iter: self.iter.clone(),
+            items: self.raw.len(),
+        }
+    }
+
+    /// Inserts a new element into the table in the given slot, and returns its
+    /// raw bucket.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must point to a slot previously returned by `remove`,
+    /// and no mutation of the table must have occurred since that call.
+    #[inline]
+    pub unsafe fn insert_in_slot(&mut self, hash: u64, slot: InsertSlot, value: T) -> Bucket<T> {
+        self.raw.insert_in_slot(hash, slot, value)
+    }
+
+    /// Removes an element from the table, returning it.
+    ///
+    /// This also returns an `InsertSlot` pointing to the newly free bucket.
+    #[inline]
+    #[allow(clippy::needless_pass_by_value)]
+    pub unsafe fn remove(&mut self, item: Bucket<T>) -> (T, InsertSlot) {
+        self.raw.remove(item)
+    }
+
+    /// Erases an element from the table, dropping it in place.
+    #[inline]
+    #[allow(clippy::needless_pass_by_value)]
+    pub unsafe fn erase(&mut self, item: Bucket<T>) {
+        self.raw.erase(item);
     }
 }
 

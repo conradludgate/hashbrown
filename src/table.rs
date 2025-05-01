@@ -2,8 +2,8 @@ use core::{fmt, iter::FusedIterator, marker::PhantomData};
 
 use crate::{
     raw::{
-        Allocator, Bucket, Global, InsertSlot, RawDrain, RawExtractIf, RawIntoIter, RawIter,
-        RawIterHash, RawTable,
+        Allocator, Bucket, Global, InsertSlot, RawDrain, RawDrainingTable, RawExtractIf,
+        RawIntoIter, RawIter, RawIterHash, RawTable,
     },
     TryReserveError,
 };
@@ -903,6 +903,13 @@ where
     pub fn drain(&mut self) -> Drain<'_, T, A> {
         Drain {
             inner: self.raw.drain(),
+        }
+    }
+
+    /// Returns a HashTable that can only ever decrease in size
+    pub fn into_drain(self) -> DrainingTable<T, A> {
+        DrainingTable {
+            raw: self.raw.into_drain(),
         }
     }
 
@@ -2376,5 +2383,277 @@ mod tests {
         assert_eq!(HashTable::<()>::new().allocation_size(), 0);
         assert_eq!(HashTable::<u32>::new().allocation_size(), 0);
         assert!(HashTable::<u32>::with_capacity(1).allocation_size() > core::mem::size_of::<u32>());
+    }
+}
+
+/// A `HashTable` that can never have new elements inserted into it.
+/// Existing elements may be retrieved, removed, and modified, but never inserted.
+///
+/// This `struct` is created by [`HashTable::into_drain`].
+#[must_use = "Iterators are lazy unless consumed"]
+pub struct DrainingTable<T, A: Allocator = Global> {
+    raw: RawDrainingTable<T, A>,
+}
+
+impl<T, A: Allocator> Iterator for DrainingTable<T, A> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.raw.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.raw.size_hint()
+    }
+
+    #[inline]
+    fn fold<B, F>(self, init: B, f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        self.raw.fold(init, f)
+    }
+}
+
+impl<T, A: Allocator> FusedIterator for DrainingTable<T, A> {}
+
+impl<T> DrainingTable<T> {
+    /// Creates an empty `DrainingTable`.
+    pub const fn empty() -> Self {
+        Self {
+            raw: RawDrainingTable::empty(),
+        }
+    }
+}
+
+impl<T, A: Allocator> DrainingTable<T, A> {
+    /// Returns a reference to an entry in the table with the given hash and
+    /// which satisfies the equality function passed.
+    ///
+    /// This method will call `eq` for all entries with the given hash, but may
+    /// also call it for entries with a different hash. `eq` should only return
+    /// true for the desired entry, at which point the search is stopped.
+    pub fn find(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
+        self.raw.get(hash, eq)
+    }
+
+    /// Returns an `OccupiedEntry` for an entry in the table with the given hash
+    /// and which satisfies the equality function passed.
+    ///
+    /// This can be used to remove the entry from the table.
+    ///
+    /// This method will call `eq` for all entries with the given hash, but may
+    /// also call it for entries with a different hash. `eq` should only return
+    /// true for the desired entry, at which point the search is stopped.
+    pub fn find_entry(
+        &mut self,
+        hash: u64,
+        eq: impl FnMut(&T) -> bool,
+    ) -> Result<DrainingOccupiedEntry<'_, T, A>, DrainingAbsentEntry<'_, T, A>> {
+        match self.raw.find(hash, eq) {
+            Some(bucket) => Ok(DrainingOccupiedEntry {
+                hash,
+                bucket,
+                table: self,
+            }),
+            None => Err(DrainingAbsentEntry { table: self }),
+        }
+    }
+
+    /// Returns the number of elements in the table.
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    /// Returns the total amount of memory allocated internally by the hash
+    /// table, in bytes.
+    ///
+    /// The returned number is informational only. It is intended to be
+    /// primarily used for memory profiling.
+    pub fn allocation_size(&self) -> usize {
+        self.raw.allocation_size()
+    }
+
+    /// Clears the table, removing all values.
+    pub fn clear(&mut self) {
+        self.raw.clear();
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` such that `f(&e)` returns `false`.
+    pub fn retain(&mut self, mut f: impl FnMut(&mut T) -> bool) {
+        // Here we only use `iter` as a temporary, preventing use-after-free
+        unsafe {
+            for item in self.raw.iter() {
+                if !f(item.as_mut()) {
+                    self.raw.erase(item);
+                }
+            }
+        }
+    }
+}
+
+/// A view into an occupied entry in a `HashTable`.
+pub struct DrainingOccupiedEntry<'a, T, A = Global>
+where
+    A: Allocator,
+{
+    hash: u64,
+    bucket: Bucket<T>,
+    table: &'a mut DrainingTable<T, A>,
+}
+
+unsafe impl<T, A> Send for DrainingOccupiedEntry<'_, T, A>
+where
+    T: Send,
+    A: Send + Allocator,
+{
+}
+unsafe impl<T, A> Sync for DrainingOccupiedEntry<'_, T, A>
+where
+    T: Sync,
+    A: Sync + Allocator,
+{
+}
+
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for DrainingOccupiedEntry<'_, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrainingOccupiedEntry")
+            .field("value", self.get())
+            .finish()
+    }
+}
+
+impl<'a, T, A> DrainingOccupiedEntry<'a, T, A>
+where
+    A: Allocator,
+{
+    /// Takes the value out of the entry, and returns it along with a
+    /// `VacantEntry` that can be used to insert another value with the same
+    /// hash as the one that was just removed.
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub fn remove(self) -> (T, DrainingVacantEntry<'a, T, A>) {
+        let (val, slot) = unsafe { self.table.raw.remove(self.bucket) };
+        (
+            val,
+            DrainingVacantEntry {
+                hash: self.hash,
+                insert_slot: slot,
+                table: self.table,
+            },
+        )
+    }
+
+    /// Gets a reference to the value in the entry.
+    #[inline]
+    pub fn get(&self) -> &T {
+        unsafe { self.bucket.as_ref() }
+    }
+
+    /// Gets a mutable reference to the value in the entry.
+    ///
+    /// If you need a reference to the `DrainingOccupiedEntry` which may outlive the
+    /// destruction of the `Entry` value, see [`into_mut`].
+    ///
+    /// [`into_mut`]: #method.into_mut
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { self.bucket.as_mut() }
+    }
+
+    /// Converts the `DrainingOccupiedEntry` into a mutable reference to the value in the entry
+    /// with a lifetime bound to the table itself.
+    ///
+    /// If you need multiple references to the `DrainingOccupiedEntry`, see [`get_mut`].
+    ///
+    /// [`get_mut`]: #method.get_mut
+    pub fn into_mut(self) -> &'a mut T {
+        unsafe { self.bucket.as_mut() }
+    }
+
+    /// Converts the `DrainingOccupiedEntry` into a mutable reference to the underlying
+    /// table.
+    pub fn into_table(self) -> &'a mut DrainingTable<T, A> {
+        self.table
+    }
+}
+
+/// A view into a vacant entry in a `DrainingTable`.
+pub struct DrainingVacantEntry<'a, T, A = Global>
+where
+    A: Allocator,
+{
+    hash: u64,
+    insert_slot: InsertSlot,
+    table: &'a mut DrainingTable<T, A>,
+}
+
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for DrainingVacantEntry<'_, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DrainingVacantEntry")
+    }
+}
+
+impl<'a, T, A> DrainingVacantEntry<'a, T, A>
+where
+    A: Allocator,
+{
+    /// Inserts a new element into the table with the hash that was used to
+    /// obtain the `DrainingVacantEntry`.
+    ///
+    /// An `DrainingOccupiedEntry` is returned for the newly inserted element.
+    #[inline]
+    pub fn insert(self, value: T) -> DrainingOccupiedEntry<'a, T, A> {
+        let bucket = unsafe {
+            self.table
+                .raw
+                .insert_in_slot(self.hash, self.insert_slot, value)
+        };
+        DrainingOccupiedEntry {
+            hash: self.hash,
+            bucket,
+            table: self.table,
+        }
+    }
+
+    /// Converts the `DrainingVacantEntry` into a mutable reference to the underlying
+    /// table.
+    pub fn into_table(self) -> &'a mut DrainingTable<T, A> {
+        self.table
+    }
+}
+
+/// Type representing the absence of an entry, as returned by [`DrainingTable::find_entry`].
+///
+/// This type only exists due to [limitations] in Rust's NLL borrow checker. In
+/// the future, `find_entry` will return an `Option<DrainingOccupiedEntry>` and this
+/// type will be removed.
+///
+/// [limitations]: https://smallcultfollowing.com/babysteps/blog/2018/06/15/mir-based-borrow-check-nll-status-update/#polonius
+pub struct DrainingAbsentEntry<'a, T, A = Global>
+where
+    A: Allocator,
+{
+    table: &'a mut DrainingTable<T, A>,
+}
+
+impl<T: fmt::Debug, A: Allocator> fmt::Debug for DrainingAbsentEntry<'_, T, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DrainingAbsentEntry")
+    }
+}
+
+impl<'a, T, A> DrainingAbsentEntry<'a, T, A>
+where
+    A: Allocator,
+{
+    /// Converts the `DrainingAbsentEntry` into a mutable reference to the underlying
+    /// table.
+    pub fn into_table(self) -> &'a mut DrainingTable<T, A> {
+        self.table
     }
 }
