@@ -9,6 +9,6 @@ pub(crate) use core::intrinsics::{likely, unlikely};
 // Implement it with a transmute for now.
 #[inline(always)]
 #[allow(clippy::useless_transmute)] // clippy is wrong, cast and transmute are different here
-pub(crate) fn invalid_mut<T>(addr: usize) -> *mut T {
+pub(crate) const fn invalid_mut<T>(addr: usize) -> *mut T {
     unsafe { core::mem::transmute(addr) }
 }

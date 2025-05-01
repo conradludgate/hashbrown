@@ -295,7 +295,7 @@ impl<T> Bucket<T> {
     /// [`RawTable::buckets`]: crate::raw::RawTable::buckets
     /// [`RawTableInner::buckets`]: RawTableInner::buckets
     #[inline]
-    unsafe fn from_base_index(base: NonNull<T>, index: usize) -> Self {
+    const unsafe fn from_base_index(base: NonNull<T>, index: usize) -> Self {
         // If mem::size_of::<T>() != 0 then return a pointer to an `element` in
         // the data part of the table (we start counting from "0", so that
         // in the expression T[last], the "last" index actually one less than the
@@ -1352,8 +1352,15 @@ impl<T, A: Allocator> RawTable<T, A> {
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn into_drain(self) -> RawDrainingTable<T, A> {
         unsafe {
+            let data = Bucket::from_base_index(self.data_end(), 0);
+            let ctrl = self.table.ctrl.as_ptr();
+            let len = self.table.buckets();
+            let end = ctrl.add(len);
+
             RawDrainingTable {
-                iter: self.iter().iter,
+                data,
+                ctrl,
+                end,
                 raw: self,
             }
         }
@@ -3409,21 +3416,6 @@ pub(crate) struct RawIterRange<T> {
 }
 
 impl<T> RawIterRange<T> {
-    /// # Safety
-    ///
-    /// You must never call next_impl on this value.
-    /// The contents of this range are garbage and using it will result in UB.
-    pub(crate) const unsafe fn empty() -> Self {
-        Self {
-            current_group: BitMaskIter::new(),
-            data: Bucket {
-                ptr: NonNull::dangling(),
-            },
-            next_ctrl: core::ptr::dangling_mut(),
-            end: core::ptr::dangling_mut(),
-        }
-    }
-
     /// Returns a `RawIterRange` covering a subset of a table.
     ///
     /// # Safety
@@ -4194,7 +4186,16 @@ impl<T, A: Allocator> RawExtractIf<'_, T, A> {
 /// This `struct` is created by [`RawTable::into_drain`].
 #[must_use = "Iterators are lazy unless consumed"]
 pub struct RawDrainingTable<T, A: Allocator = Global> {
-    iter: RawIterRange<T>,
+    // Pointer to the buckets for the current group.
+    data: Bucket<T>,
+
+    // Pointer to the current group of control bytes,
+    // Must be aligned to the group size.
+    ctrl: *const u8,
+
+    // Pointer one past the last control byte of this range.
+    end: *const u8,
+
     raw: RawTable<T, A>,
 }
 
@@ -4209,12 +4210,27 @@ impl<T, A: Allocator> Iterator for RawDrainingTable<T, A> {
             return None;
         }
 
-        // SAFETY: We check number of items to yield using `len` field.
-        let nxt = unsafe { self.iter.next_impl::<false>() };
+        let nxt = unsafe {
+            let mut current_group = Group::load_aligned(self.ctrl.cast())
+                .match_full()
+                .into_iter();
+            loop {
+                if let Some(index) = current_group.next() {
+                    break self.data.next_n(index);
+                }
 
-        debug_assert!(nxt.is_some());
-        // SAFETY: next_impl cannot return None if `DO_CHECK_PTR_RANGE` is false
-        let nxt = unsafe { nxt.unwrap_unchecked() };
+                self.ctrl = self.ctrl.add(Group::WIDTH);
+                self.data = self.data.next_n(Group::WIDTH);
+                // We might read past self.end up to the next group boundary,
+                // but this is fine because it only occurs on tables smaller
+                // than the group size where the trailing control bytes are all
+                // EMPTY. On larger tables self.end is guaranteed to be aligned
+                // to the group size (since tables are power-of-two sized).
+                current_group = Group::load_aligned(self.ctrl.cast())
+                    .match_full()
+                    .into_iter();
+            }
+        };
 
         // SAFETY: we know the bucket was allocated in this rawtable.
         Some(unsafe { self.raw.remove(nxt) }.0)
@@ -4226,13 +4242,39 @@ impl<T, A: Allocator> Iterator for RawDrainingTable<T, A> {
     }
 
     #[inline]
-    fn fold<B, F>(self, init: B, mut f: F) -> B
+    fn fold<B, F>(mut self, mut acc: B, mut f: F) -> B
     where
         Self: Sized,
         F: FnMut(B, Self::Item) -> B,
     {
-        let Self { iter, mut raw } = self;
-        unsafe { iter.fold_impl(raw.len(), init, |b, bucket| f(b, raw.remove(bucket).0)) }
+        unsafe {
+            let mut current_group = Group::load_aligned(self.ctrl.cast())
+                .match_full()
+                .into_iter();
+            loop {
+                while let Some(index) = current_group.next() {
+                    // The returned `index` will always be in the range `0..Group::WIDTH`,
+                    // so that calling `self.data.next_n(index)` is safe (see detailed explanation below).
+                    let bucket = self.data.next_n(index);
+                    acc = f(acc, self.raw.remove(bucket).0);
+                }
+
+                if self.raw.is_empty() {
+                    return acc;
+                }
+
+                self.ctrl = self.ctrl.add(Group::WIDTH);
+                self.data = self.data.next_n(Group::WIDTH);
+                // We might read past self.end up to the next group boundary,
+                // but this is fine because it only occurs on tables smaller
+                // than the group size where the trailing control bytes are all
+                // EMPTY. On larger tables self.end is guaranteed to be aligned
+                // to the group size (since tables are power-of-two sized).
+                current_group = Group::load_aligned(self.ctrl.cast())
+                    .match_full()
+                    .into_iter();
+            }
+        }
     }
 }
 
@@ -4242,10 +4284,15 @@ impl<T> RawDrainingTable<T> {
     /// Creates an empty `RawDrainingTable`.
     #[inline]
     pub const fn empty() -> Self {
-        Self {
-            // Safety: since the table is empty, we will never touch this.
-            iter: unsafe { RawIterRange::empty() },
-            raw: RawTable::new(),
+        unsafe {
+            let raw = RawTable::new();
+            let ctrl = raw.table.ctrl;
+            Self {
+                data: Bucket::from_base_index(ctrl.cast(), 0),
+                ctrl: ctrl.as_ptr(),
+                end: ctrl.as_ptr(),
+                raw: raw,
+            }
         }
     }
 }
@@ -4296,7 +4343,14 @@ impl<T, A: Allocator> RawDrainingTable<T, A> {
         // 2. The [`RawTableInner`] must already have properly initialized control bytes since
         //    we will never expose RawTable::new_uninitialized in a public API.
         RawIter {
-            iter: self.iter.clone(),
+            iter: RawIterRange {
+                current_group: Group::load_aligned(self.ctrl.cast())
+                    .match_full()
+                    .into_iter(),
+                data: self.data.clone(),
+                next_ctrl: self.ctrl.add(Group::WIDTH),
+                end: self.end,
+            },
             items: self.raw.len(),
         }
     }
