@@ -4328,6 +4328,16 @@ impl<T, A: Allocator> RawDrainingTable<T, A> {
     pub unsafe fn erase(&mut self, item: Bucket<T>) {
         self.raw.erase(item);
     }
+
+    /// Drains elements which are true under the given predicate,
+    /// and returns an iterator over the removed items.
+    #[inline]
+    pub unsafe fn extract_if(&mut self) -> RawExtractIf<'_, T, A> {
+        RawExtractIf {
+            iter: unsafe { self.iter() },
+            table: &mut self.raw,
+        }
+    }
 }
 
 #[cfg(test)]

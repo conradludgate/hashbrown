@@ -2372,6 +2372,13 @@ where
     }
 }
 
+impl<T, F, A: Allocator> ExtractIf<'_, T, F, A> {
+    /// Allow retrieving the predicate after completion.
+    pub fn into_predicate(self) -> F {
+        self.f
+    }
+}
+
 impl<T, F, A: Allocator> FusedIterator for ExtractIf<'_, T, F, A> where F: FnMut(&mut T) -> bool {}
 
 #[cfg(test)]
@@ -2430,6 +2437,25 @@ impl<T> DrainingTable<T> {
 }
 
 impl<T, A: Allocator> DrainingTable<T, A> {
+    /// An iterator visiting all elements in arbitrary order.
+    /// The iterator element type is `&'a T`.
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter {
+            inner: unsafe { self.raw.iter() },
+            marker: PhantomData,
+        }
+    }
+
+    /// An iterator visiting all elements in arbitrary order,
+    /// with mutable references to the elements.
+    /// The iterator element type is `&'a mut T`.
+    pub fn iter_mut(&self) -> IterMut<'_, T> {
+        IterMut {
+            inner: unsafe { self.raw.iter() },
+            marker: PhantomData,
+        }
+    }
+
     /// Returns a reference to an entry in the table with the given hash and
     /// which satisfies the equality function passed.
     ///
@@ -2493,6 +2519,27 @@ impl<T, A: Allocator> DrainingTable<T, A> {
                     self.raw.erase(item);
                 }
             }
+        }
+    }
+
+    /// Drains elements which are true under the given predicate,
+    /// and returns an iterator over the removed items.
+    ///
+    /// In other words, move all elements `e` such that `f(&e)` returns `true` out
+    /// into another iterator.
+    ///
+    /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
+    /// or the iteration short-circuits, then the remaining elements will be retained.
+    /// Use [`retain()`] with a negated predicate if you do not need the returned iterator.
+    ///
+    /// [`retain()`]: DrainingTable::retain
+    pub fn extract_if<F>(&mut self, f: F) -> ExtractIf<'_, T, F, A>
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        ExtractIf {
+            f,
+            inner: unsafe { self.raw.extract_if() },
         }
     }
 }
