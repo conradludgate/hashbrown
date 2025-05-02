@@ -1350,19 +1350,14 @@ impl<T, A: Allocator> RawTable<T, A> {
 
     /// Returns a RawTable that can only ever decrease in size
     #[cfg_attr(feature = "inline-more", inline)]
-    pub fn into_drain(self) -> RawDrainingTable<T, A> {
+    pub fn into_drain(&self) -> RawDrainingTable<T> {
         unsafe {
             let data = Bucket::from_base_index(self.data_end(), 0);
             let ctrl = self.table.ctrl.as_ptr();
             let len = self.table.buckets();
             let end = ctrl.add(len);
 
-            RawDrainingTable {
-                data,
-                ctrl,
-                end,
-                raw: self,
-            }
+            RawDrainingTable { data, ctrl, end }
         }
     }
 
@@ -4184,8 +4179,7 @@ impl<T, A: Allocator> RawExtractIf<'_, T, A> {
 /// Existing elements may be retrieved, removed, and modified, but never inserted.
 ///
 /// This `struct` is created by [`RawTable::into_drain`].
-#[must_use = "Iterators are lazy unless consumed"]
-pub struct RawDrainingTable<T, A: Allocator = Global> {
+pub struct RawDrainingTable<T> {
     // Pointer to the buckets for the current group.
     data: Bucket<T>,
 
@@ -4195,149 +4189,31 @@ pub struct RawDrainingTable<T, A: Allocator = Global> {
 
     // Pointer one past the last control byte of this range.
     end: *const u8,
-
-    raw: RawTable<T, A>,
 }
-
-impl<T, A: Allocator> Iterator for RawDrainingTable<T, A> {
-    type Item = T;
-
-    #[cfg_attr(feature = "inline-more", inline)]
-    fn next(&mut self) -> Option<T> {
-        // Inner iterator iterates over buckets
-        // so it can do unnecessary work if we already yielded all items.
-        if self.raw.len() == 0 {
-            return None;
-        }
-
-        let nxt = unsafe {
-            let mut current_group = Group::load_aligned(self.ctrl.cast())
-                .match_full()
-                .into_iter();
-            loop {
-                if let Some(index) = current_group.next() {
-                    break self.data.next_n(index);
-                }
-
-                self.ctrl = self.ctrl.add(Group::WIDTH);
-                self.data = self.data.next_n(Group::WIDTH);
-                // We might read past self.end up to the next group boundary,
-                // but this is fine because it only occurs on tables smaller
-                // than the group size where the trailing control bytes are all
-                // EMPTY. On larger tables self.end is guaranteed to be aligned
-                // to the group size (since tables are power-of-two sized).
-                current_group = Group::load_aligned(self.ctrl.cast())
-                    .match_full()
-                    .into_iter();
-            }
-        };
-
-        // SAFETY: we know the bucket was allocated in this rawtable.
-        Some(unsafe { self.raw.remove(nxt) }.0)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.raw.len(), Some(self.raw.len()))
-    }
-
-    #[inline]
-    fn fold<B, F>(mut self, mut acc: B, mut f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        unsafe {
-            let mut current_group = Group::load_aligned(self.ctrl.cast())
-                .match_full()
-                .into_iter();
-            loop {
-                while let Some(index) = current_group.next() {
-                    // The returned `index` will always be in the range `0..Group::WIDTH`,
-                    // so that calling `self.data.next_n(index)` is safe (see detailed explanation below).
-                    let bucket = self.data.next_n(index);
-                    acc = f(acc, self.raw.remove(bucket).0);
-                }
-
-                if self.raw.is_empty() {
-                    return acc;
-                }
-
-                self.ctrl = self.ctrl.add(Group::WIDTH);
-                self.data = self.data.next_n(Group::WIDTH);
-                // We might read past self.end up to the next group boundary,
-                // but this is fine because it only occurs on tables smaller
-                // than the group size where the trailing control bytes are all
-                // EMPTY. On larger tables self.end is guaranteed to be aligned
-                // to the group size (since tables are power-of-two sized).
-                current_group = Group::load_aligned(self.ctrl.cast())
-                    .match_full()
-                    .into_iter();
-            }
-        }
-    }
-}
-
-impl<T, A: Allocator> FusedIterator for RawDrainingTable<T, A> {}
 
 impl<T> RawDrainingTable<T> {
     /// Creates an empty `RawDrainingTable`.
     #[inline]
     pub const fn empty() -> Self {
         unsafe {
-            let raw = RawTable::new();
-            let ctrl = raw.table.ctrl;
+            let table = &RawTableInner::NEW;
+            let ctrl = table.ctrl;
             Self {
                 data: Bucket::from_base_index(ctrl.cast(), 0),
                 ctrl: ctrl.as_ptr(),
                 end: ctrl.as_ptr(),
-                raw: raw,
             }
         }
     }
 }
 
-impl<T, A: Allocator> RawDrainingTable<T, A> {
-    /// Gets a reference to an element in the table.
-    #[inline]
-    pub fn get(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
-        self.raw.get(hash, eq)
-    }
-
-    /// Searches for an element in the table.
-    #[inline]
-    pub fn find(&mut self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<Bucket<T>> {
-        self.raw.find(hash, eq)
-    }
-
-    /// Returns the number of elements in the table.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.raw.len()
-    }
-
-    /// Returns the total amount of memory allocated internally by the hash
-    /// table, in bytes.
-    ///
-    /// The returned number is informational only. It is intended to be
-    /// primarily used for memory profiling.
-    #[inline]
-    pub fn allocation_size(&self) -> usize {
-        self.raw.allocation_size()
-    }
-
-    /// Removes all elements from the table without freeing the backing memory.
-    #[inline]
-    pub fn clear(&mut self) {
-        self.raw.clear();
-    }
-
+impl<T> RawDrainingTable<T> {
     /// Returns an iterator over every element in the table. It is up to
     /// the caller to ensure that the `RawTable` outlives the `RawIter`.
     /// Because we cannot make the `next` method unsafe on the `RawIter`
     /// struct, we have to make the `iter` method unsafe.
     #[inline]
-    pub unsafe fn iter(&self) -> RawIter<T> {
+    pub unsafe fn iter(&self, items: usize) -> RawIter<T> {
         // SAFETY:
         // 1. The caller must uphold the safety contract for `iter` method.
         // 2. The [`RawTableInner`] must already have properly initialized control bytes since
@@ -4351,45 +4227,52 @@ impl<T, A: Allocator> RawDrainingTable<T, A> {
                 next_ctrl: self.ctrl.add(Group::WIDTH),
                 end: self.end,
             },
-            items: self.raw.len(),
+            items,
         }
     }
 
-    /// Inserts a new element into the table in the given slot, and returns its
-    /// raw bucket.
-    ///
-    /// # Safety
-    ///
-    /// `slot` must point to a slot previously returned by `remove`,
-    /// and no mutation of the table must have occurred since that call.
-    #[inline]
-    pub unsafe fn insert_in_slot(&mut self, hash: u64, slot: InsertSlot, value: T) -> Bucket<T> {
-        self.raw.insert_in_slot(hash, slot, value)
-    }
+    #[cfg_attr(feature = "inline-more", inline)]
+    pub unsafe fn try_take_all<B, E, F>(
+        &mut self,
+        mut n: usize,
+        mut acc: B,
+        mut f: F,
+    ) -> Result<B, E>
+    where
+        Self: Sized,
+        F: FnMut(B, Bucket<T>) -> Result<B, E>,
+    {
+        unsafe {
+            let mut current_group = Group::load_aligned(self.ctrl.cast())
+                .match_full()
+                .into_iter();
+            loop {
+                while let Some(index) = current_group.next() {
+                    // The returned `index` will always be in the range `0..Group::WIDTH`,
+                    // so that calling `self.data.next_n(index)` is safe (see detailed explanation below).
+                    let bucket = self.data.next_n(index);
+                    acc = match f(acc, bucket) {
+                        Ok(acc) => acc,
+                        Err(e) => return Err(e),
+                    };
+                    n -= 1;
+                }
 
-    /// Removes an element from the table, returning it.
-    ///
-    /// This also returns an `InsertSlot` pointing to the newly free bucket.
-    #[inline]
-    #[allow(clippy::needless_pass_by_value)]
-    pub unsafe fn remove(&mut self, item: Bucket<T>) -> (T, InsertSlot) {
-        self.raw.remove(item)
-    }
+                if n == 0 {
+                    return Ok(acc);
+                }
 
-    /// Erases an element from the table, dropping it in place.
-    #[inline]
-    #[allow(clippy::needless_pass_by_value)]
-    pub unsafe fn erase(&mut self, item: Bucket<T>) {
-        self.raw.erase(item);
-    }
-
-    /// Drains elements which are true under the given predicate,
-    /// and returns an iterator over the removed items.
-    #[inline]
-    pub unsafe fn extract_if(&mut self) -> RawExtractIf<'_, T, A> {
-        RawExtractIf {
-            iter: unsafe { self.iter() },
-            table: &mut self.raw,
+                self.ctrl = self.ctrl.add(Group::WIDTH);
+                self.data = self.data.next_n(Group::WIDTH);
+                // We might read past self.end up to the next group boundary,
+                // but this is fine because it only occurs on tables smaller
+                // than the group size where the trailing control bytes are all
+                // EMPTY. On larger tables self.end is guaranteed to be aligned
+                // to the group size (since tables are power-of-two sized).
+                current_group = Group::load_aligned(self.ctrl.cast())
+                    .match_full()
+                    .into_iter();
+            }
         }
     }
 }

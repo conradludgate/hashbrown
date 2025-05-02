@@ -910,6 +910,7 @@ where
     pub fn into_drain(self) -> DrainingTable<T, A> {
         DrainingTable {
             raw: self.raw.into_drain(),
+            table: self,
         }
     }
 
@@ -2381,57 +2382,21 @@ impl<T, F, A: Allocator> ExtractIf<'_, T, F, A> {
 
 impl<T, F, A: Allocator> FusedIterator for ExtractIf<'_, T, F, A> where F: FnMut(&mut T) -> bool {}
 
-#[cfg(test)]
-mod tests {
-    use super::HashTable;
-
-    #[test]
-    fn test_allocation_info() {
-        assert_eq!(HashTable::<()>::new().allocation_size(), 0);
-        assert_eq!(HashTable::<u32>::new().allocation_size(), 0);
-        assert!(HashTable::<u32>::with_capacity(1).allocation_size() > core::mem::size_of::<u32>());
-    }
-}
-
 /// A `HashTable` that can never have new elements inserted into it.
 /// Existing elements may be retrieved, removed, and modified, but never inserted.
 ///
 /// This `struct` is created by [`HashTable::into_drain`].
-#[must_use = "Iterators are lazy unless consumed"]
 pub struct DrainingTable<T, A: Allocator = Global> {
-    raw: RawDrainingTable<T, A>,
+    raw: RawDrainingTable<T>,
+    table: HashTable<T, A>,
 }
-
-impl<T, A: Allocator> Iterator for DrainingTable<T, A> {
-    type Item = T;
-
-    #[inline]
-    fn next(&mut self) -> Option<T> {
-        self.raw.next()
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.raw.size_hint()
-    }
-
-    #[inline]
-    fn fold<B, F>(self, init: B, f: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.raw.fold(init, f)
-    }
-}
-
-impl<T, A: Allocator> FusedIterator for DrainingTable<T, A> {}
 
 impl<T> DrainingTable<T> {
     /// Creates an empty `DrainingTable`.
     pub const fn empty() -> Self {
         Self {
             raw: RawDrainingTable::empty(),
+            table: HashTable::new(),
         }
     }
 }
@@ -2441,7 +2406,7 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     /// The iterator element type is `&'a T`.
     pub fn iter(&self) -> Iter<'_, T> {
         Iter {
-            inner: unsafe { self.raw.iter() },
+            inner: unsafe { self.raw.iter(self.table.len()) },
             marker: PhantomData,
         }
     }
@@ -2451,7 +2416,7 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     /// The iterator element type is `&'a mut T`.
     pub fn iter_mut(&self) -> IterMut<'_, T> {
         IterMut {
-            inner: unsafe { self.raw.iter() },
+            inner: unsafe { self.raw.iter(self.table.len()) },
             marker: PhantomData,
         }
     }
@@ -2463,7 +2428,7 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     /// also call it for entries with a different hash. `eq` should only return
     /// true for the desired entry, at which point the search is stopped.
     pub fn find(&self, hash: u64, eq: impl FnMut(&T) -> bool) -> Option<&T> {
-        self.raw.get(hash, eq)
+        self.table.find(hash, eq)
     }
 
     /// Returns an `OccupiedEntry` for an entry in the table with the given hash
@@ -2479,7 +2444,7 @@ impl<T, A: Allocator> DrainingTable<T, A> {
         hash: u64,
         eq: impl FnMut(&T) -> bool,
     ) -> Result<DrainingOccupiedEntry<'_, T, A>, DrainingAbsentEntry<'_, T, A>> {
-        match self.raw.find(hash, eq) {
+        match self.table.raw.find(hash, eq) {
             Some(bucket) => Ok(DrainingOccupiedEntry {
                 hash,
                 bucket,
@@ -2491,7 +2456,7 @@ impl<T, A: Allocator> DrainingTable<T, A> {
 
     /// Returns the number of elements in the table.
     pub fn len(&self) -> usize {
-        self.raw.len()
+        self.table.raw.len()
     }
 
     /// Returns the total amount of memory allocated internally by the hash
@@ -2500,12 +2465,12 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     /// The returned number is informational only. It is intended to be
     /// primarily used for memory profiling.
     pub fn allocation_size(&self) -> usize {
-        self.raw.allocation_size()
+        self.table.raw.allocation_size()
     }
 
     /// Clears the table, removing all values.
     pub fn clear(&mut self) {
-        self.raw.clear();
+        self.table.raw.clear();
     }
 
     /// Retains only the elements specified by the predicate.
@@ -2513,10 +2478,11 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     /// In other words, remove all elements `e` such that `f(&e)` returns `false`.
     pub fn retain(&mut self, mut f: impl FnMut(&mut T) -> bool) {
         // Here we only use `iter` as a temporary, preventing use-after-free
+        let len = self.len();
         unsafe {
-            for item in self.raw.iter() {
+            for item in self.raw.iter(len) {
                 if !f(item.as_mut()) {
-                    self.raw.erase(item);
+                    self.table.raw.erase(item);
                 }
             }
         }
@@ -2539,7 +2505,54 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     {
         ExtractIf {
             f,
-            inner: unsafe { self.raw.extract_if() },
+            inner: unsafe {
+                RawExtractIf {
+                    iter: self.raw.iter(self.len()),
+                    table: &mut self.table.raw,
+                }
+            },
+        }
+    }
+
+    /// Pop removes on entry from this hashtable.
+    #[inline]
+    pub fn pop(&mut self) -> Option<T> {
+        match self.try_take_all((), |(), t| Err(t)) {
+            Ok(()) => None,
+            Err(t) => Some(t),
+        }
+    }
+
+    /// Take all the values out of this hashtable, calling the function for each item removed.
+    ///
+    /// This API mirrors [`Iterator::fold`], to help manage some extra state.
+    #[inline]
+    pub fn take_all<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, T) -> B,
+    {
+        match self.try_take_all(init, |acc, t| Ok::<B, core::convert::Infallible>(f(acc, t))) {
+            Ok(acc) => acc,
+            Err(e) => match e {},
+        }
+    }
+
+    /// Try take all the values out of this hashtable, calling the function for each item removed.
+    /// This will exit early if the function returns an error. Later values will not be lost.
+    ///
+    /// This API mirrors [`Iterator::try_fold`], to help manage some extra state.
+    #[inline]
+    pub fn try_take_all<B, E, F>(&mut self, init: B, mut f: F) -> Result<B, E>
+    where
+        Self: Sized,
+        F: FnMut(B, T) -> Result<B, E>,
+    {
+        unsafe {
+            self.raw
+                .try_take_all(self.table.len(), init, |acc, bucket| {
+                    f(acc, self.table.raw.remove(bucket).0)
+                })
         }
     }
 }
@@ -2584,7 +2597,7 @@ where
     /// hash as the one that was just removed.
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn remove(self) -> (T, DrainingVacantEntry<'a, T, A>) {
-        let (val, slot) = unsafe { self.table.raw.remove(self.bucket) };
+        let (val, slot) = unsafe { self.table.table.raw.remove(self.bucket) };
         (
             val,
             DrainingVacantEntry {
@@ -2657,6 +2670,7 @@ where
     pub fn insert(self, value: T) -> DrainingOccupiedEntry<'a, T, A> {
         let bucket = unsafe {
             self.table
+                .table
                 .raw
                 .insert_in_slot(self.hash, self.insert_slot, value)
         };
@@ -2702,5 +2716,17 @@ where
     /// table.
     pub fn into_table(self) -> &'a mut DrainingTable<T, A> {
         self.table
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HashTable;
+
+    #[test]
+    fn test_allocation_info() {
+        assert_eq!(HashTable::<()>::new().allocation_size(), 0);
+        assert_eq!(HashTable::<u32>::new().allocation_size(), 0);
+        assert!(HashTable::<u32>::with_capacity(1).allocation_size() > core::mem::size_of::<u32>());
     }
 }
