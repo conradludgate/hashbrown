@@ -1348,7 +1348,7 @@ impl<T, A: Allocator> RawTable<T, A> {
         }
     }
 
-    /// Returns a RawTable that can only ever decrease in size
+    /// Returns a [`RawDrainingTable`], which is like a `RawTable`, but it can only ever decrease in size.
     #[cfg_attr(feature = "inline-more", inline)]
     pub fn into_drain(&self) -> RawDrainingTable<T> {
         unsafe {
@@ -4176,7 +4176,8 @@ impl<T, A: Allocator> RawExtractIf<'_, T, A> {
 }
 
 /// A `RawTable` that can never have new elements inserted into it.
-/// Existing elements may be retrieved, removed, and modified, but never inserted.
+/// Existing elements may be retrieved, removed, and modified,
+/// but new elements cannot be inserted.
 ///
 /// This `struct` is created by [`RawTable::into_drain`].
 pub struct RawDrainingTable<T> {
@@ -4276,6 +4277,9 @@ impl<T> RawDrainingTable<T> {
         }
     }
 }
+
+unsafe impl<T> Send for RawDrainingTable<T> where T: Send {}
+unsafe impl<T> Sync for RawDrainingTable<T> where T: Sync {}
 
 #[cfg(test)]
 mod test_map {

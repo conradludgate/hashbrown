@@ -2383,12 +2383,28 @@ impl<T, F, A: Allocator> ExtractIf<'_, T, F, A> {
 impl<T, F, A: Allocator> FusedIterator for ExtractIf<'_, T, F, A> where F: FnMut(&mut T) -> bool {}
 
 /// A `HashTable` that can never have new elements inserted into it.
-/// Existing elements may be retrieved, removed, and modified, but never inserted.
+/// Existing elements may be retrieved, removed, and modified,
+/// but new elemenets can never be inserted.
+///
+/// This API is intended for use in incremental hash tables.
+/// The [`pop`](DrainingTable::pop) function allows for average time O(1)
+/// removal, as opposed to `extract_if(|_| true).next()`, which might need
+/// to scan the entire table before finding the next initialised bucket.
 ///
 /// This `struct` is created by [`HashTable::into_drain`].
 pub struct DrainingTable<T, A: Allocator = Global> {
     raw: RawDrainingTable<T>,
     table: HashTable<T, A>,
+}
+
+impl<T, A> Clone for DrainingTable<T, A>
+where
+    T: Clone,
+    A: Allocator + Clone,
+{
+    fn clone(&self) -> Self {
+        self.table.clone().into_drain()
+    }
 }
 
 impl<T> DrainingTable<T> {
@@ -2469,8 +2485,12 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     }
 
     /// Clears the table, removing all values.
+    ///
+    /// This does not preserve the allocation, since it cannot be re-used.
     pub fn clear(&mut self) {
-        self.table.raw.clear();
+        self.table.clear();
+        self.table.shrink_to_fit(|_| 0);
+        self.raw = self.table.raw.into_drain();
     }
 
     /// Retains only the elements specified by the predicate.
@@ -2514,7 +2534,10 @@ impl<T, A: Allocator> DrainingTable<T, A> {
         }
     }
 
-    /// Pop removes on entry from this hashtable.
+    /// Pop removes an entry from this hashtable.
+    ///
+    /// This has average O(1) cost, compared to `self.extract_if(|_| true).next()` which has
+    /// average time O(n) cost (with `n = self.capacity()`).
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         match self.try_take_all((), |(), t| Err(t)) {
@@ -2557,7 +2580,7 @@ impl<T, A: Allocator> DrainingTable<T, A> {
     }
 }
 
-/// A view into an occupied entry in a `HashTable`.
+/// A view into an occupied entry in a [`DrainingTable`].
 pub struct DrainingOccupiedEntry<'a, T, A = Global>
 where
     A: Allocator,
@@ -2642,7 +2665,7 @@ where
     }
 }
 
-/// A view into a vacant entry in a `DrainingTable`.
+/// A view into a vacant entry in a [`DrainingTable`].
 pub struct DrainingVacantEntry<'a, T, A = Global>
 where
     A: Allocator,
@@ -2663,9 +2686,9 @@ where
     A: Allocator,
 {
     /// Inserts a new element into the table with the hash that was used to
-    /// obtain the `DrainingVacantEntry`.
+    /// obtain the [`DrainingVacantEntry`].
     ///
-    /// An `DrainingOccupiedEntry` is returned for the newly inserted element.
+    /// A [`DrainingOccupiedEntry`] is returned for the newly inserted element.
     #[inline]
     pub fn insert(self, value: T) -> DrainingOccupiedEntry<'a, T, A> {
         let bucket = unsafe {
@@ -2721,6 +2744,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::table::DrainingTable;
+
     use super::HashTable;
 
     #[test]
@@ -2728,5 +2753,63 @@ mod tests {
         assert_eq!(HashTable::<()>::new().allocation_size(), 0);
         assert_eq!(HashTable::<u32>::new().allocation_size(), 0);
         assert!(HashTable::<u32>::with_capacity(1).allocation_size() > core::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn draining_table_pop_remove_same_group() {
+        let mut table = HashTable::<u64>::with_capacity(2);
+
+        table.insert_unique(0, 0, |x| *x);
+        table.insert_unique(1, 1, |x| *x);
+
+        let drain = table.into_drain();
+
+        drain.find(0, |&x| x == 0).unwrap();
+        drain.find(1, |&x| x == 1).unwrap();
+
+        let mut drain0 = drain.clone();
+        let mut drain1 = drain;
+
+        drain0.find_entry(1, |&x| x == 1).unwrap().remove();
+        assert_eq!(drain0.pop().unwrap(), 0);
+        assert_eq!(drain0.len(), 0);
+
+        drain1.find_entry(0, |&x| x == 0).unwrap().remove();
+        assert_eq!(drain1.pop().unwrap(), 1);
+        assert_eq!(drain1.len(), 0);
+    }
+
+    #[test]
+    fn draining_table_remove_reinsert() {
+        let mut table = HashTable::<u64>::with_capacity(2);
+
+        table.insert_unique(0, 0, |x| *x);
+        table.insert_unique(1, 1, |x| *x);
+
+        let drain = table.into_drain();
+
+        drain.find(0, |&x| x == 0).unwrap();
+        drain.find(1, |&x| x == 1).unwrap();
+
+        let mut drain0 = drain.clone();
+        let mut drain1 = drain;
+
+        let (_, e) = drain0.find_entry(1, |&x| x == 1).unwrap().remove();
+        e.insert(1);
+        assert_eq!(drain0.pop().unwrap(), 0);
+        assert_eq!(drain0.pop().unwrap(), 1);
+        assert_eq!(drain0.len(), 0);
+
+        let (_, e) = drain1.find_entry(0, |&x| x == 0).unwrap().remove();
+        e.insert(0);
+        assert_eq!(drain1.pop().unwrap(), 0);
+        assert_eq!(drain1.pop().unwrap(), 1);
+        assert_eq!(drain1.len(), 0);
+    }
+
+    #[test]
+    fn draining_table_empty() {
+        let mut drain = DrainingTable::<u64>::empty();
+        assert!(drain.pop().is_none());
     }
 }
